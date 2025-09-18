@@ -1,4 +1,4 @@
-name: Sync prodedgeaccountstorage to repo
+name: Sync prodedgeaccountstorage to repo (chunked + low disk use)
 
 on:
   schedule:
@@ -8,57 +8,176 @@ on:
 permissions:
   contents: write
 
+env:
+  MAX_BLOBS_PER_RUN: "750"     # adjust down if you still hit disk issues
+  MAX_GB_PER_RUN: "10"         # soft size cap (best-effort)
+
 jobs:
   sync:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout
+      - name: Free disk space (Android, .NET, Haskell, docker images, swap)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Show free space
+        run: |
+          df -h /
+          echo "Workspace:"
+          du -sh . || true
+
+      # First checkout: just the state file so we can compute the target container.
+      - name: Checkout state only
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          sparse-checkout: |
+            .github/prodedge-sync-state.json
+          sparse-checkout-cone: false
+          lfs: false
 
       - name: Install Azure CLI
         uses: azure/setup-azure@v4
 
-      - name: List containers & download all blobs
+      - name: Decide which container to sync next
+        id: pick
         env:
           AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
           AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
         run: |
           set -euo pipefail
-          ROOT="azure/prodedgeaccountstorage"
-          mkdir -p "$ROOT"
+          STATE_DIR=".github"
+          STATE_FILE="$STATE_DIR/prodedge-sync-state.json"
+          mkdir -p "$STATE_DIR"
 
-          # get all container names
           mapfile -t CONTAINERS < <(az storage container list \
             --account-name "$AZURE_STORAGE_ACCOUNT" \
             --account-key "$AZURE_STORAGE_KEY" \
-            --query "[].name" -o tsv)
+            --query "[].name" -o tsv | sort)
 
-          echo "Found containers: ${CONTAINERS[*]}"
+          if [[ ${#CONTAINERS[@]} -eq 0 ]]; then
+            echo "No containers found."
+            echo "container=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-          for c in "${CONTAINERS[@]}"; do
-            TARGET="$ROOT/$c"
-            echo "Syncing container '$c' -> $TARGET"
-            rm -rf "$TARGET"
-            mkdir -p "$TARGET"
+          if [[ -f "$STATE_FILE" ]]; then
+            CUR_INDEX=$(jq -r '.next_index // 0' "$STATE_FILE" 2>/dev/null || echo 0)
+          else
+            CUR_INDEX=0
+          fi
 
-            az storage blob download-batch \
+          TOTAL=${#CONTAINERS[@]}
+          CUR_INDEX=$(( CUR_INDEX % TOTAL ))
+          CONTAINER="${CONTAINERS[$CUR_INDEX]}"
+
+          echo "container=$CONTAINER" >> "$GITHUB_OUTPUT"
+          echo "next_index=$(( (CUR_INDEX + 1) % TOTAL ))" >> "$GITHUB_OUTPUT"
+
+      # Re-checkout: only the state file + the target container path.
+      - name: Checkout target paths
+        if: steps.pick.outputs.container != ''
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: false
+          sparse-checkout: |
+            .github/prodedge-sync-state.json
+            azure/prodedgeaccountstorage/${{ steps.pick.outputs.container }}
+          sparse-checkout-cone: false
+
+      - name: Sync limited blobs from the chosen container
+        if: steps.pick.outputs.container != ''
+        env:
+          AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+          AZURE_STORAGE_KEY: ${{ secrets.AZURE_STORAGE_KEY }}
+          CONTAINER: ${{ steps.pick.outputs.container }}
+          MAX_BLOBS: ${{ env.MAX_BLOBS_PER_RUN }}
+          MAX_GB: ${{ env.MAX_GB_PER_RUN }}
+        run: |
+          set -euo pipefail
+          ROOT="azure/prodedgeaccountstorage"
+          TARGET="$ROOT/$CONTAINER"
+          mkdir -p "$TARGET"
+
+          echo "Listing blobs for $CONTAINER..."
+          # Get blob names sorted for stable diffs
+          mapfile -t BLOBS < <(az storage blob list \
+            --account-name "$AZURE_STORAGE_ACCOUNT" \
+            --account-key "$AZURE_STORAGE_KEY" \
+            -c "$CONTAINER" \
+            --query "[].name" -o tsv | LC_ALL=C sort)
+
+          echo "Total blobs: ${#BLOBS[@]}"
+          COUNT=0
+
+          # helper to get used GB (rounded down)
+          used_gb() { df -BG / | awk 'NR==2{gsub("G","",$3); print $3}'; }
+          start_used=$(used_gb)
+          max_inc="${MAX_GB:-10}"
+
+          for b in "${BLOBS[@]}"; do
+            # stop if we reached blob cap
+            if (( COUNT >= ${MAX_BLOBS:-750} )); then
+              echo "Reached blob cap (${MAX_BLOBS}). Stopping."
+              break
+            fi
+
+            # stop if we exceeded soft GB increase since start
+            now_used=$(used_gb)
+            if (( now_used - start_used >= max_inc )); then
+              echo "Reached soft size cap (+${max_inc}GB). Stopping."
+              break
+            fi
+
+            # Skip if already present (best-effort: quick exists check)
+            if [[ -f "$TARGET/$b" ]]; then
+              continue
+            fi
+
+            mkdir -p "$(dirname "$TARGET/$b")"
+            az storage blob download \
               --account-name "$AZURE_STORAGE_ACCOUNT" \
               --account-key "$AZURE_STORAGE_KEY" \
-              -s "$c" \
-              -d "$TARGET" \
+              -c "$CONTAINER" \
+              -n "$b" \
+              -f "$TARGET/$b" \
               --no-progress
+
+            COUNT=$((COUNT+1))
           done
 
+          echo "Downloaded blobs this run: $COUNT"
+
+          # Update state file for next run
+          NEXT_INDEX="${{ steps.pick.outputs.next_index }}"
+          jq -n --argjson next "$NEXT_INDEX" --arg synced "$CONTAINER" \
+             --arg downloaded "$COUNT" \
+             '{next_index: $next, last_synced_container: $synced, downloaded_this_run: ($downloaded|tonumber), updated_utc: (now|todate)}' \
+             > .github/prodedge-sync-state.json
+
       - name: Commit & push if changes
+        if: steps.pick.outputs.container != ''
         run: |
+          set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          if git status --porcelain | grep -q '^\( M\| M\|A \|D \|??\)'; then
-            git add azure/prodedgeaccountstorage
-            git commit -m "Sync prodedgeaccountstorage containers ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
+          touched_container=$(jq -r '.last_synced_container' .github/prodedge-sync-state.json)
+          git add ".github/prodedge-sync-state.json" "azure/prodedgeaccountstorage/${touched_container}" || true
+
+          if ! git diff --cached --quiet; then
+            git commit -m "Chunked sync (${touched_container}): $(jq -r '.downloaded_this_run' .github/prodedge-sync-state.json) blobs ($(date -u +'%Y-%m-%d %H:%M:%S UTC'))"
             git push
           else
             echo "No changes to commit."
           fi
+
+      - name: Final free space snapshot
+        run: df -h /

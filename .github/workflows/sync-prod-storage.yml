@@ -42,8 +42,21 @@ jobs:
           sparse-checkout-cone: false
           lfs: false
 
-      - name: Install Azure CLI
-        uses: azure/setup-azure@v4
+      - name: Ensure Azure CLI (and jq) are installed
+        run: |
+          set -euo pipefail
+          if ! command -v az >/dev/null 2>&1; then
+            echo "Installing Azure CLI..."
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          else
+            echo "Azure CLI present:"
+            az version
+          fi
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "Installing jq..."
+            sudo apt-get update -y
+            sudo apt-get install -y jq
+          fi
 
       - name: Decide which container to sync next
         id: pick
@@ -59,7 +72,7 @@ jobs:
           mapfile -t CONTAINERS < <(az storage container list \
             --account-name "$AZURE_STORAGE_ACCOUNT" \
             --account-key "$AZURE_STORAGE_KEY" \
-            --query "[].name" -o tsv | sort)
+            --query "[].name" -o tsv | LC_ALL=C sort)
 
           if [[ ${#CONTAINERS[@]} -eq 0 ]]; then
             echo "No containers found."
@@ -107,7 +120,6 @@ jobs:
           mkdir -p "$TARGET"
 
           echo "Listing blobs for $CONTAINER..."
-          # Get blob names sorted for stable diffs
           mapfile -t BLOBS < <(az storage blob list \
             --account-name "$AZURE_STORAGE_ACCOUNT" \
             --account-key "$AZURE_STORAGE_KEY" \
@@ -117,30 +129,23 @@ jobs:
           echo "Total blobs: ${#BLOBS[@]}"
           COUNT=0
 
-          # helper to get used GB (rounded down)
           used_gb() { df -BG / | awk 'NR==2{gsub("G","",$3); print $3}'; }
           start_used=$(used_gb)
           max_inc="${MAX_GB:-10}"
 
           for b in "${BLOBS[@]}"; do
-            # stop if we reached blob cap
             if (( COUNT >= ${MAX_BLOBS:-750} )); then
               echo "Reached blob cap (${MAX_BLOBS}). Stopping."
               break
             fi
-
-            # stop if we exceeded soft GB increase since start
             now_used=$(used_gb)
             if (( now_used - start_used >= max_inc )); then
               echo "Reached soft size cap (+${max_inc}GB). Stopping."
               break
             fi
-
-            # Skip if already present (best-effort: quick exists check)
             if [[ -f "$TARGET/$b" ]]; then
               continue
             fi
-
             mkdir -p "$(dirname "$TARGET/$b")"
             az storage blob download \
               --account-name "$AZURE_STORAGE_ACCOUNT" \
@@ -149,17 +154,15 @@ jobs:
               -n "$b" \
               -f "$TARGET/$b" \
               --no-progress
-
             COUNT=$((COUNT+1))
           done
 
           echo "Downloaded blobs this run: $COUNT"
 
-          # Update state file for next run
           NEXT_INDEX="${{ steps.pick.outputs.next_index }}"
           jq -n --argjson next "$NEXT_INDEX" --arg synced "$CONTAINER" \
              --arg downloaded "$COUNT" \
-             '{next_index: $next, last_synced_container: $synced, downloaded_this_run: ($downloaded|tonumber), updated_utc: (now|todate)}' \
+             '{next_index: $next, last_synced_container: $synced, downloaded_this_run: ($downloaded|tonumber), updated_utc: (now | todate)}' \
              > .github/prodedge-sync-state.json
 
       - name: Commit & push if changes
